@@ -1,0 +1,10 @@
+.oefj
+**/.oefj
+*.pem
+*.key
+.env
+.env.*
+__pycache__/
+.venv/
+.kube/
+*.kubeconfig

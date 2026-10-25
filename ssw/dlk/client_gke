@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Compatibility entrypoint; execution targets the current AKS kubeconfig.
+set -euo pipefail
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/client_aks" "$@"

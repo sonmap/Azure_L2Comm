@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Azure AKS execution settings. Supply the actual ACR loginServer and central02 IP.
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config_l2comm_aks}"
+export NAMESPACE="${NAMESPACE:-l2comm-batch}"
+export POD_MOUNT_PATH="${POD_MOUNT_PATH:-/home/jupyter}"
+export NFS_PATH="${NFS_PATH:-/batch_gke/l2/rsvp}"
+export PV_NAME="${PV_NAME:-l2comm-rsvp-pv}"
+export PVC_NAME="${PVC_NAME:-l2comm-rsvp-pvc}"
+export SA_KEY_PATH="${SA_KEY_PATH:-/home/jupyter/.oefj}"
+export BQ_JOB_PROJECT="${BQ_JOB_PROJECT:-pjt-c-admin}"

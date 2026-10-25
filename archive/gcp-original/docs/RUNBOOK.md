@@ -1,0 +1,1042 @@
+# L2Comm03-01 RUNBOOK (Ubuntu VM 작업 기준)
+
+VPC 내부 Ubuntu VM 한 대에서 `git clone` 부터 배치 실행·결과 확인까지
+전부 수행하는 절차입니다. 위에서부터 순서대로 복사해 실행하십시오.
+
+각 단계는 **실행 → 확인 → 기대 결과** 구성입니다.
+기대 결과가 나오지 않으면 다음 단계로 넘어가지 말고 §13(오류 대응)를 보십시오.
+
+---
+
+## 계정 분리 원칙
+
+| 계정 | 용도 | 사용 단계 |
+|---|---|---|
+| `admin@sonmap.net` | Owner. **권한(IAM) 부여 + 네트워크 관리** | §4, §5, §10-3 |
+| `cho@sonmap.net` | 배포·운영 주체 | §6 이후 전부 (§6-2 권한 사전 점검 필수) |
+
+각 스크립트는 시작 시 실행 계정을 검증하고, 틀리면 전환 방법을 안내하며 중단합니다.
+우회가 필요하면 `SKIP_ACCOUNT_CHECK=1` 을 앞에 붙입니다.
+
+## VM 요구사항
+
+- Ubuntu 20.04 / 22.04 / 24.04
+- **Shared VPC `vpc-prod-edp-hub` 내부**에 위치 (Private endpoint 접근 때문)
+- 인터넷 egress 가능 (패키지 설치, GitHub clone)
+- sudo 권한
+
+---
+
+## 1. VM 기본 패키지 설치
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git curl apt-transport-https ca-certificates gnupg
+```
+
+### 확인
+
+```bash
+git --version
+```
+
+기대: `git version 2.x.x`
+
+---
+
+## 2. gcloud CLI 설치
+
+이미 설치되어 있으면 건너뜁니다.
+
+```bash
+gcloud version
+```
+
+`command not found` 이면 아래를 실행합니다.
+
+```bash
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+  | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+
+sudo apt-get update
+sudo apt-get install -y google-cloud-cli
+```
+
+### 확인
+
+```bash
+gcloud version
+```
+
+기대: `Google Cloud SDK 5xx.x.x` 등 버전 출력.
+
+---
+
+## 3. kubectl 및 GKE 인증 플러그인 설치
+
+GKE 접속에는 `gke-gcloud-auth-plugin` 이 **반드시** 필요합니다.
+
+```bash
+sudo apt-get install -y kubectl google-cloud-cli-gke-gcloud-auth-plugin
+```
+
+### 확인
+
+```bash
+kubectl version --client
+gke-gcloud-auth-plugin --version
+```
+
+기대: 두 명령 모두 버전 출력.
+
+```bash
+echo 'export USE_GKE_GCLOUD_AUTH_PLUGIN=True' >> ~/.bashrc
+source ~/.bashrc
+```
+
+---
+
+## 4. Owner 계정으로 권한 부여  (**Owner 계정**)
+
+### 4-1. Owner 로그인
+
+VM 에는 브라우저가 없으므로 `--no-launch-browser` 를 사용합니다.
+출력된 URL 을 PC 브라우저에서 열고, 받은 인증 코드를 터미널에 붙여 넣습니다.
+
+```bash
+gcloud auth login admin@sonmap.net --no-launch-browser
+```
+
+### 4-2. 배포 주체 계정도 미리 로그인
+
+```bash
+gcloud auth login cho@sonmap.net --no-launch-browser
+```
+
+### 확인
+
+```bash
+gcloud auth list
+```
+
+기대: 두 계정이 모두 목록에 표시됨.
+
+### 4-3. 저장소 clone
+
+```bash
+cd ~
+git clone https://github.com/sonmap/Gcp_Managed_GKE_L2Comm03-01.git
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+chmod +x gcloud/*.sh ssw/dlk/*.sh ssw/dlk/client_gke
+chmod +x mnt/batch_gke/l2_gke_sh/rsvp/GP_L2RSVP_001_1/run-gke.sh
+```
+
+### 확인
+
+```bash
+ls -l gcloud/
+```
+
+기대: `00-env.sh`, `00-bootstrap.sh`, `10-network.sh`, `20-source-connection.sh`,
+`30-platform.sh`, `90-teardown.sh`, `99-verify.sh` 가 실행 권한(`-rwxr-xr-x`)으로 존재.
+
+### 4-4. 변수 확인 (가장 중요)
+
+```bash
+vi gcloud/00-env.sh
+```
+
+프로젝트 ID, CIDR, 계정, SA 값이 실제 환경과 맞는지 확인하고 필요하면 수정합니다.
+
+```bash
+gcloud config set account admin@sonmap.net
+gcloud config set project gcp-prod-edp-edge-509423
+
+source gcloud/00-env.sh
+echo "EDGE    : ${EDGE_PROJECT} (${EDGE_PROJECT_NUMBER})"
+echo "HOST    : ${HOST_PROJECT}"
+echo "DATA    : ${DATA_PROJECT}"
+echo "AR      : ${AR_PROJECT}"
+echo "OWNER   : ${OWNER_USER}"
+echo "ADMIN   : ${ADMIN_USER}"
+echo "SA_GKE  : ${SA_GKE}"
+echo "IMAGE   : ${IMAGE_URI}"
+echo "VM_SA   : ${VM_SA}"
+echo "NODE_SA : ${AUTOPILOT_NODE_SA}"
+```
+
+기대: 모든 값이 출력되고 오류가 없음.
+
+> `VM_SA`(620081195575-)와 `AUTOPILOT_NODE_SA`(541022739403-)의 프로젝트 번호가
+> 서로 다릅니다. 위에 출력된 `EDGE_PROJECT_NUMBER` 와 대조해 어느 쪽이 맞는지
+> 확인하고, 틀리면 `00-env.sh` 를 수정하십시오.
+
+이 VM 자신의 서비스 계정도 확인합니다.
+
+```bash
+curl -s -H "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email
+echo
+```
+
+기대: 출력값이 `00-env.sh` 의 `VM_SA` 와 일치.
+
+### 4-5. 00-bootstrap 실행
+
+```bash
+gcloud config get-value account
+```
+
+기대: `admin@sonmap.net`
+
+```bash
+./gcloud/00-bootstrap.sh
+```
+
+VM 기본 SA 로도 gcloud 를 돌릴 예정이면:
+
+```bash
+GRANT_VM_DEPLOYER=true ./gcloud/00-bootstrap.sh
+```
+
+### 확인
+
+```bash
+gcloud services list --enabled --project=gcp-prod-edp-edge-509423 \
+  --filter="config.name:(container.googleapis.com OR cloudbuild.googleapis.com OR bigquery.googleapis.com)" \
+  --format="value(config.name)"
+```
+
+기대: 3개 모두 출력.
+
+```bash
+gcloud services list --enabled --project=gcp-prod-edp-hub-vpchost \
+  --filter="config.name:artifactregistry.googleapis.com" \
+  --format="value(config.name)"
+```
+
+기대: `artifactregistry.googleapis.com` (AR 이 Host 프로젝트에 있음).
+
+```bash
+gcloud projects get-iam-policy gcp-prod-edp-edge-509423 \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:cho@sonmap.net" \
+  --format="value(bindings.role)"
+```
+
+기대 (7개): `cloudbuild.builds.editor`, `compute.viewer`, `container.admin`,
+`iam.serviceAccountAdmin`, `iam.serviceAccountUser`,
+`resourcemanager.projectIamAdmin`, `serviceusage.serviceUsageAdmin`
+
+```bash
+gcloud projects get-iam-policy gcp-prod-edp-hub-vpchost \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:cho@sonmap.net" \
+  --format="value(bindings.role)"
+```
+
+기대 (2개): `artifactregistry.admin`, `serviceusage.serviceUsageAdmin`
+
+> 네트워크 관리(`compute.networkAdmin` / `securityAdmin`)는 Owner 영역이므로
+> 배포 주체에게 부여하지 않습니다. GKE 생성에 필요한 Subnet 접근은
+> §5-6 에서 해당 Subnet 한정으로 `compute.networkUser` 가 부여됩니다.
+
+### 4-6. 조직 수준 권한 확인 (Shared VPC 연결용)
+
+Shared VPC 서비스 프로젝트 연결에는 조직 수준 권한이 필요하며,
+이는 프로젝트 IAM 이 아니라 스크립트가 부여하지 못합니다.
+
+Owner 계정이 조직 수준 `compute.xpnAdmin` 을 이미 보유하고 있다면 추가 작업이
+없습니다. §5 는 Owner 로 실행하므로 배포 주체에게 이 권한을 위임할 필요가 없습니다.
+
+확인:
+
+```bash
+gcloud organizations list
+```
+
+```bash
+ORG_ID=<위에서 확인한 ID>
+
+gcloud organizations get-iam-policy "${ORG_ID}" \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:admin@sonmap.net AND bindings.role:roles/compute.xpnAdmin" \
+  --format="value(bindings.role)"
+```
+
+기대: `roles/compute.xpnAdmin` 출력 (또는 Owner 가 조직 Owner 여서 포함).
+출력이 없고 Shared VPC 연결도 아직이면, 조직 관리자가 Owner 계정에
+`roles/compute.xpnAdmin` 을 부여해야 §5-4 가 성공합니다.
+
+---
+
+## 5. 네트워크 구성  (**Owner 계정 계속**)
+
+Shared VPC 연결, Host 프로젝트 Subnet 생성, Subnet/Project 레벨 IAM 부여는
+모두 네트워크 관리 영역이므로 Owner 계정으로 수행합니다.
+
+### 5-1. 계정 확인
+
+```bash
+gcloud config get-value account
+```
+
+기대: `admin@sonmap.net` (§4 에서 이미 전환된 상태)
+
+### 5-2. CIDR 중복 사전 확인
+
+```bash
+gcloud compute networks subnets list \
+  --project=gcp-prod-edp-hub-vpchost \
+  --regions=asia-northeast3 \
+  --format="table(name, ipCidrRange, secondaryIpRanges[].ipCidrRange)"
+```
+
+아래 대역과 겹치는 것이 없어야 합니다.
+
+```text
+10.252.1.0/24      Node
+100.64.128.0/19    Pod
+10.254.5.0/28      Control Plane
+```
+
+### 5-3. Shared VPC 연결 여부 확인
+
+```bash
+gcloud compute shared-vpc associated-projects list gcp-prod-edp-hub-vpchost \
+  --format="value(id)" | grep gcp-prod-edp-edge-509423
+```
+
+출력이 있으면 이미 연결된 상태입니다 (4-6 생략 가능).
+
+### 5-4. 10-network 실행 (Owner)
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+./gcloud/10-network.sh
+```
+
+> CIDR 목록을 보여준 뒤 Enter 입력을 기다립니다. 확인 후 Enter.
+
+### 확인
+
+```bash
+gcloud compute networks subnets describe subnet-prod-edp-l2comm-gke-an3 \
+  --project=gcp-prod-edp-hub-vpchost \
+  --region=asia-northeast3 \
+  --format="yaml(name, ipCidrRange, secondaryIpRanges, privateIpGoogleAccess)"
+```
+
+기대:
+
+```text
+ipCidrRange: 10.252.1.0/24
+secondaryIpRanges:
+- ipCidrRange: 100.64.128.0/19
+  rangeName: pods-prod-edp-l2comm-an3
+privateIpGoogleAccess: true
+```
+
+Secondary Range 는 **Pod 1개만** 있어야 합니다 (Service Range 없음).
+
+### 5-6. Subnet 레벨 IAM 확인
+
+```bash
+gcloud compute networks subnets get-iam-policy subnet-prod-edp-l2comm-gke-an3 \
+  --project=gcp-prod-edp-hub-vpchost --region=asia-northeast3 \
+  --format="yaml(bindings)"
+```
+
+기대: `roles/compute.networkUser` 에 아래 4개.
+
+```text
+serviceAccount:service-<EDGE번호>@container-engine-robot.iam.gserviceaccount.com
+serviceAccount:<EDGE번호>@cloudservices.gserviceaccount.com
+user:cho@sonmap.net
+serviceAccount:<VM_SA>
+```
+
+> 배포 주체에게 Host 프로젝트 전체 네트워크 권한을 주지 않고, 이 Subnet 에만
+> 한정해 부여합니다. 이것이 있어야 §8 에서 GKE 생성이 가능합니다.
+
+---
+
+## 6. 배포 주체 전환 및 권한 사전 점검  (**배포 주체**)
+
+### 6-1. 계정 전환
+
+여기서부터 배포 주체 계정으로 전환합니다.
+
+```bash
+gcloud config set account cho@sonmap.net
+gcloud config get-value account
+```
+
+기대: `cho@sonmap.net`
+
+### 6-2. 권한 사전 점검 (중요)
+
+20 단계 이후에 필요한 권한을 미리 확인합니다. 여기서 걸러내지 않으면
+작업 도중 `PERMISSION_DENIED` 로 멈춥니다.
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+./gcloud/05-check-permissions.sh
+```
+
+기대: 모든 항목 `OK`, 마지막에 `점검 통과` 메시지.
+
+`FAIL` 이 있으면 어떤 Role 이 빠졌는지 표시됩니다. Owner 로 되돌아가
+재실행한 뒤 다시 점검합니다.
+
+```bash
+gcloud config set account admin@sonmap.net
+./gcloud/00-bootstrap.sh
+./gcloud/10-network.sh            # Subnet 항목이 FAIL 인 경우
+gcloud config set account cho@sonmap.net
+./gcloud/05-check-permissions.sh
+```
+
+---
+
+## 7. Cloud Build 저장소 연결  (**배포 주체**)
+
+기존 `github-l2comm` Connection 에는 `Gcp_Managed_GKE_L2Comm` 과
+`Gcp_Managed_GKE_L2Comm02` 만 연결되어 있습니다. **Connection 은 재사용**하고
+그 아래에 `Gcp_Managed_GKE_L2Comm03-01` 저장소만 **추가**합니다.
+Connection 을 새로 만들 필요는 없습니다.
+
+### 7-1. Connection 확인
+
+```bash
+gcloud builds connections list \
+  --project=gcp-prod-edp-edge-509423 --region=asia-northeast3 \
+  --format="table(name.basename(), installationState.stage)"
+```
+
+기대: `github-l2comm` 이 `COMPLETE`.
+
+현재 연결된 저장소 목록:
+
+```bash
+gcloud builds repositories list \
+  --connection=github-l2comm \
+  --project=gcp-prod-edp-edge-509423 --region=asia-northeast3 \
+  --format="table(name.basename(), remoteUri)"
+```
+
+현재 연결 목록을 확인합니다. 이전 03 연결이 이미 있을 수도 있습니다.
+
+### 7-2. GitHub App 접근 권한 확인 (선행 조건)
+
+Cloud Build GitHub App 이 **Only select repositories** 로 설치되어 있으면,
+GitHub 쪽에서 `Gcp_Managed_GKE_L2Comm03-01` 을 먼저 허용해야 7-3 이 성공합니다.
+
+브라우저에서 확인합니다.
+
+```text
+https://github.com/settings/installations
+  또는 조직 계정이면
+https://github.com/organizations/sonmap/settings/installations
+```
+
+`Google Cloud Build` → **Configure** → Repository access 에서
+`Gcp_Managed_GKE_L2Comm03-01` 이 포함되어 있는지 확인하고, 없으면 추가합니다.
+(`All repositories` 로 설정되어 있으면 이 단계는 불필요합니다.)
+
+> 이 단계를 건너뛰면 7-3 에서 저장소를 찾지 못하거나
+> `PERMISSION_DENIED` / `NOT_FOUND` 가 발생합니다.
+
+### 7-3. 저장소 추가 실행
+
+```bash
+./gcloud/20-source-connection.sh
+```
+
+> 스크립트는 멱등입니다. 이미 연결되어 있으면 `SKIP (이미 연결됨)` 을 출력하고
+> 재생성하지 않습니다. 기존 `L2Comm` / `L2Comm02` 연결에도 영향을 주지 않습니다.
+
+### 확인
+
+```bash
+gcloud builds repositories list \
+  --connection=github-l2comm \
+  --project=gcp-prod-edp-edge-509423 --region=asia-northeast3 \
+  --format="table(name.basename(), remoteUri)"
+```
+
+기대: 현재 목록에 더해 `Gcp_Managed_GKE_L2Comm03-01` 이 추가되어 보임. 기존 연결 개수는 환경마다 다릅니다.
+
+```text
+Gcp_Managed_GKE_L2Comm     https://github.com/sonmap/Gcp_Managed_GKE_L2Comm.git
+Gcp_Managed_GKE_L2Comm02   https://github.com/sonmap/Gcp_Managed_GKE_L2Comm02.git
+Gcp_Managed_GKE_L2Comm03-01   https://github.com/sonmap/Gcp_Managed_GKE_L2Comm03-01.git
+```
+
+---
+
+## 8. 플랫폼 구성 (AR / SA / Trigger / GKE)  (**배포 주체**)
+
+```bash
+./gcloud/30-platform.sh
+```
+
+> GKE Autopilot 생성에 **15~25분** 걸립니다. 중간에 끊지 마십시오.
+> SSH 가 끊길 염려가 있으면 `tmux` 또는 `screen` 안에서 실행하십시오.
+>
+> ```bash
+> sudo apt-get install -y tmux
+> tmux new -s l2comm
+> ./gcloud/30-platform.sh
+> # 분리: Ctrl+b 누른 뒤 d / 재접속: tmux attach -t l2comm
+> ```
+
+### 8-1. Artifact Registry (Host 프로젝트)
+
+```bash
+gcloud artifacts repositories list \
+  --project=gcp-prod-edp-hub-vpchost --location=asia-northeast3 \
+  --format="table(name.basename(), format)"
+```
+
+기대: `ar-l2comm-python`, `ar-l2comm-helm` (둘 다 DOCKER).
+
+AR 이 Host 프로젝트에 있으므로 **저장소 레벨 IAM** 이 핵심입니다.
+
+```bash
+gcloud artifacts repositories get-iam-policy ar-l2comm-python \
+  --project=gcp-prod-edp-hub-vpchost --location=asia-northeast3 \
+  --format="yaml(bindings)"
+```
+
+기대:
+
+```text
+roles/artifactregistry.writer : sa-l2comm-gke@gcp-prod-edp-edge-509423...
+roles/artifactregistry.reader : 541022739403-compute@...   (Autopilot Node SA)
+                                620081195575-compute@...   (VM SA)
+                                user:cho@sonmap.net
+```
+
+### 8-2. 통합 서비스 계정
+
+```bash
+gcloud projects get-iam-policy gcp-prod-edp-edge-509423 \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:sa-l2comm-gke@" \
+  --format="value(bindings.role)"
+```
+
+기대 (Edge 에 4개): `bigquery.jobUser`, `compute.viewer`,
+`logging.logWriter`, `storage.objectViewer`
+
+> `workflows.invoker`, `container.developer`, `artifactregistry.writer` 가
+> 여기에 **없어야** 정상입니다. AR 권한은 8-1 의 저장소 레벨에 있습니다.
+
+### 8-3. Pod 생성 주체 권한
+
+```bash
+gcloud projects get-iam-policy gcp-prod-edp-edge-509423 \
+  --flatten="bindings[].members" \
+  --filter="bindings.role:roles/container.developer" \
+  --format="value(bindings.members)"
+```
+
+기대: `user:cho@sonmap.net` 과 VM SA 포함.
+
+### 8-4. BigQuery Dataset 권한
+
+```bash
+bq show --format=prettyjson pjt-c-admin:dlk_sample \
+  | python3 -c "import json,sys; [print(a) for a in json.load(sys.stdin)['access'] if 'l2comm' in str(a)]"
+```
+
+기대:
+
+```text
+{'role': 'WRITER', 'userByEmail': 'sa-l2comm-gke@gcp-prod-edp-edge-509423.iam.gserviceaccount.com'}
+```
+
+> 조직에 따라 `bq add-iam-policy-binding --dataset` 이 allowlist 기능이라
+> 거부될 수 있습니다. 그 경우 스크립트가 자동으로 dataset ACL 방식으로
+> 전환해 `WRITER` 로 부여합니다. `WRITER` 는 `roles/bigquery.dataEditor`
+> 와 동등하므로 둘 중 어느 형태로 보여도 정상입니다.
+
+### 8-5. Workload Identity 바인딩
+
+```bash
+gcloud iam service-accounts get-iam-policy \
+  sa-l2comm-gke@gcp-prod-edp-edge-509423.iam.gserviceaccount.com \
+  --project=gcp-prod-edp-edge-509423 --format="yaml(bindings)"
+```
+
+기대: `roles/iam.workloadIdentityUser` 에
+`serviceAccount:gcp-prod-edp-edge-509423.svc.id.goog[l2comm-batch/ksa-l2comm-batch]`
+
+### 8-6. GKE 클러스터
+
+```bash
+gcloud container clusters describe gke-l2comm-batch-an3 \
+  --project=gcp-prod-edp-edge-509423 --region=asia-northeast3 \
+  --format="yaml(name, status, autopilot.enabled, network, subnetwork,
+                 ipAllocationPolicy.clusterSecondaryRangeName,
+                 ipAllocationPolicy.servicesIpv4Cidr,
+                 privateClusterConfig.masterIpv4CidrBlock,
+                 privateClusterConfig.enablePrivateEndpoint,
+                 workloadIdentityConfig.workloadPool)"
+```
+
+기대:
+
+```text
+status: RUNNING
+autopilot.enabled: true
+clusterSecondaryRangeName: pods-prod-edp-l2comm-an3
+servicesIpv4Cidr: 34.118.224.0/20      <- GKE managed
+masterIpv4CidrBlock: 10.254.5.0/28
+enablePrivateEndpoint: true
+workloadPool: gcp-prod-edp-edge-509423.svc.id.goog
+```
+
+### 8-7. Cloud Build Trigger
+
+```bash
+gcloud builds triggers describe trg-l2comm03-01-python-image \
+  --project=gcp-prod-edp-edge-509423 --region=asia-northeast3 \
+  --format="yaml(name, filename, serviceAccount, includedFiles,
+                 repositoryEventConfig.push.branch)"
+```
+
+기대:
+
+```text
+includedFiles: app/**, cloudbuild/**, gcloud/**
+serviceAccount: ...sa-l2comm-gke@...
+repository: .../repositories/Gcp_Managed_GKE_L2Comm03-01
+```
+
+> **저장소 경로를 반드시 확인하십시오.** L2Comm02 의 트리거
+> `trg-l2comm-python-image` 를 재사용하면 L2Comm02 소스로 빌드되어
+> 빌드 로그에 `REPO_FULL_NAME: sonmap/Gcp_Managed_GKE_L2Comm02` 가 찍힙니다.
+> L2Comm03-01 은 `trg-l2comm03-01-python-image` 를 따로 사용하며, 스크립트가
+> 기존 트리거의 저장소 불일치를 감지하면 중단합니다.
+
+---
+
+## 9. 이미지 빌드
+
+### 9-1. 수동 빌드 실행
+
+```bash
+gcloud builds triggers run trg-l2comm03-01-python-image \
+  --project=gcp-prod-edp-edge-509423 --region=asia-northeast3 \
+  --branch=main
+```
+
+### 9-2. 상태 확인
+
+```bash
+gcloud builds list \
+  --project=gcp-prod-edp-edge-509423 --region=asia-northeast3 \
+  --limit=5 --format="table(id, status, createTime, duration)"
+```
+
+기대: 최신 빌드가 `SUCCESS`. `WORKING` 이면 몇 분 대기 후 재확인.
+
+실패 시 로그:
+
+```bash
+BUILD_ID=$(gcloud builds list --project=gcp-prod-edp-edge-509423 \
+  --region=asia-northeast3 --limit=1 --format="value(id)")
+
+gcloud builds log "${BUILD_ID}" \
+  --project=gcp-prod-edp-edge-509423 --region=asia-northeast3
+```
+
+### 9-3. 이미지 생성 확인
+
+```bash
+gcloud artifacts docker images list \
+  asia-northeast3-docker.pkg.dev/gcp-prod-edp-hub-vpchost/ar-l2comm-python \
+  --include-tags --format="table(package, tags, createTime)"
+```
+
+기대: `python-bq-batch` 에 `v1` 태그.
+
+---
+
+## 10. VM NFS 및 kubectl 준비
+
+### 10-1. /ssw/dlk 심볼릭 링크
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+bash ssw/dlk/install-vm.sh
+```
+
+L2Comm02 PoC 를 같은 VM 에서 했다면 `/ssw/dlk` 가 이미 02 체크아웃을
+가리키고 있어 아래 오류가 납니다.
+
+```text
+ERROR: /ssw/dlk already exists and is not the expected symlink.
+```
+
+먼저 무엇을 가리키는지 확인합니다.
+
+```bash
+ls -ld /ssw/dlk
+readlink -f /ssw/dlk
+```
+
+다른 체크아웃을 가리키는 **심볼릭 링크**이면 실행 중인 배치가 없는지 확인한 후 03-01로 다시 연결합니다. 실제 디렉터리는 이 명령으로 교체하지 않습니다.
+
+```bash
+test -L /ssw/dlk && sudo ln -sfn "$HOME/Gcp_Managed_GKE_L2Comm03-01/ssw/dlk" /ssw/dlk
+bash ssw/dlk/install-vm.sh
+```
+
+심볼릭 링크가 아니라 **실제 디렉터리**이면 백업 후 재실행합니다.
+
+```bash
+sudo mv /ssw/dlk "/ssw/dlk.bak.$(date +%Y%m%d%H%M%S)"
+bash ssw/dlk/install-vm.sh
+```
+
+### 확인
+
+```bash
+ls -l /ssw/dlk
+readlink -f /ssw/dlk
+```
+
+기대: `~/Gcp_Managed_GKE_L2Comm03-01/ssw/dlk` 를 가리키는 심볼릭 링크.
+
+### 10-2. NFS 서버 구성
+
+```bash
+sudo bash /ssw/dlk/setup-nfs-server.sh
+```
+
+### 확인
+
+```bash
+findmnt /srv/l2comm-nfs
+exportfs -v
+ss -lntp | grep 2049
+ls /srv/l2comm-nfs/batch_gke/l2/rsvp/GP_L2RSVP_001_1/python
+```
+
+기대: bind mount 존재, export 목록 출력, 2049 LISTEN,
+`bq_auth_smoke.py`가 보임. SOURCE는 `Gcp_Managed_GKE_L2Comm03-01/mnt`여야 합니다.
+
+VM 내부 IP 를 기록해 둡니다.
+
+```bash
+hostname -I | awk '{print $1}'
+```
+
+### 10-3. 방화벽 구성 — **Owner 계정**
+
+Host 프로젝트에 두 종류의 규칙이 필요합니다.
+
+| 규칙 | 경로 | 없으면 |
+|---|---|---|
+| `fw-allow-l2comm-nfs` | GKE Node/Pod → VM NFS (tcp:2049) | PVC 가 `Pending` 에서 멈춤 |
+| `fw-l2comm-master-to-node` | Control Plane(`10.254.5.0/28`) → Node (tcp:10250 등) | `kubectl logs` / `exec` 가 `No agent available` |
+
+두 번째 규칙은 Shared VPC 환경에서 GKE 가 Host 프로젝트에 자동 생성하지
+못하는 경우가 있어 명시적으로 만듭니다. Pod 실행과 별도로 확인해야 하며
+로그와 exec 가 막힙니다.
+
+> **선행 조건**: 노드 네트워크 태그를 조회해야 하므로 클러스터에 노드가
+> 한 번이라도 기동된 뒤 실행하십시오. 배치를 한 번 돌리면 노드가 뜹니다.
+> 아직이면 §11 을 먼저 수행하고 여기로 돌아오셔도 됩니다.
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+
+gcloud config set account admin@sonmap.net
+./gcloud/11-firewall.sh
+gcloud config set account cho@sonmap.net
+```
+
+스크립트가 하는 일:
+
+1. 현재 규칙 목록 출력
+2. `fw-allow-l2comm-nfs` 생성 (이미 있으면 SKIP)
+3. NFS 서버 VM 에 `l2comm-nfs` 태그 부여
+   (실행 중인 VM 을 메타데이터로 자동 인식, 이미 있으면 SKIP)
+4. 노드 네트워크 태그를 자동 조회해 `fw-l2comm-master-to-node` 생성
+5. 결과 출력
+
+다른 VM 이 NFS 서버이거나, 자동 인식한 프로젝트가 틀려
+`was not found` 가 나오면 직접 지정해 재실행합니다.
+
+```bash
+# VM 이 어느 프로젝트/존에 있는지 확인
+gcloud compute instances list --filter="name:infra-son01" \
+  --format="table(name, zone.basename(), networkInterfaces[0].networkIP)"
+
+NFS_VM_NAME=<VM> NFS_VM_ZONE=<ZONE> NFS_VM_PROJECT=<PRJ> \
+  ./gcloud/11-firewall.sh
+```
+
+> 태그 부여에 실패해도 스크립트는 중단되지 않고 Control Plane 규칙 생성까지
+> 진행합니다. 기존에 **target tag 없는** 2049 허용 규칙
+> (`allow-l2comm-gke-node-to-nfs` 등)이 이미 있다면 네트워크 내 모든 VM 에
+> 적용되므로 태그가 없어도 NFS 는 동작합니다.
+> `SKIP_NFS_TAG=true` 로 태그 단계를 건너뛸 수 있습니다.
+
+### 확인
+
+```bash
+gcloud compute firewall-rules list \
+  --project=gcp-prod-edp-hub-vpchost \
+  --filter="network:vpc-prod-edp-hub" \
+  --format="table(name, sourceRanges.list(), allowed[].map().firewall_rule().list(), targetTags.list())" \
+  | grep -E "NAME|2049|10.254.5"
+```
+
+기대: 2049 규칙과 `10.254.5.0/28` 출발 규칙이 모두 보임.
+
+```bash
+export KUBECONFIG=$HOME/.kube/config_new-autopilot
+kubectl -n kube-system get pods -l k8s-app=konnectivity-agent
+```
+
+기대: `Running`.
+
+> `allowed.ports` 는 Compute API 의 서버측 필터가 지원하지 않습니다.
+> (`Invalid list filter expression`) 포트는 위처럼 `grep` 으로 거릅니다.
+
+### 10-4. 클러스터 자격증명
+
+`client_gke` 는 기본적으로 `$HOME/.kube/config_new-autopilot` 를 봅니다.
+
+```bash
+KUBECONFIG=$HOME/.kube/config_new-autopilot \
+gcloud container clusters get-credentials gke-l2comm-batch-an3 \
+  --project=gcp-prod-edp-edge-509423 \
+  --region=asia-northeast3 \
+  --internal-ip
+```
+
+### 확인
+
+```bash
+export KUBECONFIG=$HOME/.kube/config_new-autopilot
+kubectl cluster-info
+kubectl get nodes
+```
+
+기대: Control Plane 주소 응답. 타임아웃이면 §13 참고.
+
+### 10-5. Namespace / KSA
+
+```bash
+kubectl get ns l2comm-batch
+kubectl -n l2comm-batch get serviceaccount ksa-l2comm-batch -o yaml
+```
+
+기대: 어노테이션에
+`iam.gke.io/gcp-service-account: sa-l2comm-gke@gcp-prod-edp-edge-509423.iam.gserviceaccount.com`
+
+없으면 생성합니다.
+
+```bash
+kubectl create namespace l2comm-batch
+kubectl -n l2comm-batch create serviceaccount ksa-l2comm-batch
+kubectl -n l2comm-batch annotate serviceaccount ksa-l2comm-batch \
+  iam.gke.io/gcp-service-account=sa-l2comm-gke@gcp-prod-edp-edge-509423.iam.gserviceaccount.com \
+  --overwrite
+```
+
+### 10-6. RSVP 인증 파일 확인
+
+Pod에는 `SA_KEY_PATH=/home/jupyter/.oefj`,
+`GOOGLE_APPLICATION_CREDENTIALS=/home/jupyter/.oefj`, `BQ_JOB_PROJECT=pjt-c-admin`을 전달합니다.
+현재 Python BigQuery 코드는 `credentials=`를 명시하며 KSA/GSA 또는 ADC로 대체 인증하지 않습니다.
+키 파일이 없거나 유효하지 않으면 실패합니다. `SA_KEY_CHECK=0`으로 검사를 생략하지 않습니다.
+
+
+현재 RSVP 샘플은 Workload Identity 대신 NFS로 전달되는 서비스 계정 키를 명시적으로 읽습니다.
+KSA 어노테이션만으로 `bq_auth_smoke.py`의 키 파일 요구사항이 대체되지 않습니다.
+
+| VM 파일 | Pod 경로 |
+|---|---|
+| `mnt/batch_gke/l2/rsvp/.oefj` | `/home/jupyter/.oefj` |
+| `mnt/batch_gke/l2/rsvp/GP_L2RSVP_001_1/python/bq_auth_smoke.py` | `/home/jupyter/GP_L2RSVP_001_1/python/bq_auth_smoke.py` |
+
+기존 02에서 사용하던 키가 필요한 경우, Git에 올리지 않고 VM 안에서만 복사합니다.
+키 내용을 출력하지 마십시오.
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+if [ ! -f mnt/batch_gke/l2/rsvp/.oefj ]; then
+  cp ~/Gcp_Managed_GKE_L2Comm02/mnt/batch_gke/l2/rsvp/.oefj \
+     mnt/batch_gke/l2/rsvp/.oefj
+fi
+test -r mnt/batch_gke/l2/rsvp/.oefj && echo '키 파일 존재'
+```
+
+기존 키가 없으면 여기서 중단하고 기존 운영 인증 파일 위치부터 확인합니다.
+파일과 상위 디렉터리는 Pod 실행 UID에서 읽고 접근할 수 있어야 합니다.
+
+---
+
+## 11. RSVP 배치 실행
+
+### 11-1. DRY_RUN — 매니페스트 확인
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+export KUBECONFIG="$HOME/.kube/config_new-autopilot"
+DRY_RUN=1 \
+DOCKER_IMAGE=asia-northeast3-docker.pkg.dev/gcp-prod-edp-hub-vpchost/ar-l2comm-python/python-bq-batch:v1 \
+./mnt/batch_gke/l2_gke_sh/rsvp/GP_L2RSVP_001_1/run-gke.sh \
+  20261016 20261016 20261016 180000 \
+  0 4 16 \
+  /mnt/batch_gke/l2/rsvp/GP_L2RSVP_001_1/python \
+  python bq_auth_smoke.py
+```
+
+기대 결과:
+
+| 항목 | 값 |
+|---|---|
+| 생성 파일 | `pv.yaml`, `pvc.yaml`, `pod.yaml` |
+| Kubernetes 리소스 | `apiVersion: v1`, `kind: Pod` |
+| NFS 경로 | `/batch_gke/l2/rsvp` |
+| 마운트 | `/home/jupyter` (읽기 전용) |
+| PV / PVC | `l2comm-rsvp-pv` / `l2comm-rsvp-pvc` |
+| 작업 경로 | `/home/jupyter/GP_L2RSVP_001_1/python` |
+| 리소스 | CPU 4, 메모리 16Gi |
+
+래퍼가 VM 경로를 Pod 경로로 변환합니다. 첫 9개 인자는 필수이며 10번째 이후는 프로그램 인자입니다.
+`DRY_RUN` 기본값은 1입니다. 실제 실행에는 반드시 0을 지정합니다.
+
+### 11-2. 실제 실행
+
+11-1과 같은 명령에서 `DRY_RUN=1`만 `DRY_RUN=0`으로 바꿉니다.
+이미지는 Host 프로젝트의 기존 이미지를 명시적으로 사용합니다.
+`run-gke.sh` 자체의 기본 이미지는 Edge 프로젝트이므로 이미지 변수를 생략하지 마십시오.
+
+기대 흐름은 PV/PVC 적용 → Pod 생성 → Succeeded 대기 → 로그 출력 → 성공 Pod 삭제입니다.
+정상 로그에 `L2COMM: SUCCESS`와 `[SUCCESS]`가 표시됩니다.
+이 검사는 `SELECT` 상수 쿼리로 인증과 BigQuery 실행 권한을 확인하며, 테이블을 생성하거나 적재하지 않습니다.
+키 서비스 계정은 쿼리 실행 프로젝트 `pjt-c-admin`에 BigQuery Job User 권한이 필요합니다.
+
+### 11-3. 다른 터미널에서 관찰
+
+```bash
+export KUBECONFIG="$HOME/.kube/config_new-autopilot"
+kubectl -n l2comm-batch get pods -w
+```
+
+실행 중이거나 실패하여 남은 Pod 이름을 확인한 뒤 조회합니다.
+
+```bash
+kubectl -n l2comm-batch get pods
+# 아래 POD_NAME을 실제 이름으로 바꿉니다.
+kubectl -n l2comm-batch describe pod POD_NAME
+kubectl -n l2comm-batch logs POD_NAME
+```
+
+현재 클라이언트는 성공 Pod를 즉시 삭제하고 실패 Pod는 남깁니다.
+`KEEP_JOB`, Job TTL, `debug-gke.sh`, Cloud Logging 자동 폴백은 지원하지 않습니다.
+`kubectl logs` 실패 시 별도로 Cloud Logging을 조회해야 합니다.
+
+---
+
+## 12. 결과 및 현재 설정 확인
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+source ssw/dlk/client_common
+printf 'NFS_PATH=%s\nPOD_MOUNT_PATH=%s\nPV_NAME=%s\nPVC_NAME=%s\n' \
+  "$NFS_PATH" "$POD_MOUNT_PATH" "$PV_NAME" "$PVC_NAME"
+findmnt /srv/l2comm-nfs
+readlink -f /ssw/dlk
+```
+
+`L2COMM: SUCCESS`는 인증 검사 성공입니다. 이전 03의 `/app/main.py` 적재 검사와는 다릅니다.
+`app/main.py` 역시 `.oefj` 키를 명시적으로 사용합니다. 이미지에 포함되므로 변경 적용 시 이미지 재빌드가 필요합니다. Compute 리전 조회 권한과 BigQuery 적재 권한이 추가로 필요합니다.
+리전 수를 고정된 43건으로 검증하지 않습니다.
+
+정기 실행은 수동 테스트 성공 후 동일 RSVP 래퍼와 이미지 변수를 사용해 VM crontab에 등록합니다.
+
+---
+
+## 13. 오류 대응
+
+| 증상 | 원인 | 조치 |
+|---|---|---|
+| 스크립트가 계정 오류로 중단 | 계정 분리 규칙 | `00-bootstrap.sh` / `10-network.sh` 는 `admin@sonmap.net`, `20`·`30`·`90` 은 `cho@sonmap.net`. `gcloud config set account <계정>` |
+| `gke-gcloud-auth-plugin` not found | 플러그인 미설치 | §3 재실행 후 `export USE_GKE_GCLOUD_AUTH_PLUGIN=True` |
+| `kubectl` 타임아웃 | VPC 외부이거나 라우팅 문제 | VM 이 `vpc-prod-edp-hub` 내부인지 확인, `--internal-ip` 로 재인증 (10-4) |
+| `PERMISSION_DENIED` (subnet 생성) | Owner 아닌 계정으로 10-network 실행 | `gcloud config set account admin@sonmap.net` 후 재실행 |
+| GKE 생성 시 subnet 접근 거부 | 배포 주체의 Subnet networkUser 누락 | §5-6 확인. 없으면 Owner 로 `10-network.sh` 재실행 |
+| Shared VPC 연결 실패 | Owner 의 조직 수준 `compute.xpnAdmin` 없음 | §4-6 으로 확인. 조직 관리자가 Owner 계정에 부여해야 함 |
+| Cluster 생성 실패 | GKE Service Agent 권한 | `10-network.sh` 재실행 후 `container.hostServiceAgentUser` 확인 |
+| Build `denied: ...uploadArtifacts` | Build SA 의 AR writer 누락 | AR 이 Host 프로젝트이므로 **저장소 레벨** writer 확인 (8-1) |
+| Pod `ImagePullBackOff` | 크로스 프로젝트 AR 권한 | 저장소 레벨 reader 확인 (8-1), `AUTOPILOT_NODE_SA` 값 대조 |
+| Pod 에서 BigQuery 403 | 키 서비스 계정의 권한 부족 | RSVP는 `.oefj` 인증 사용. 키 계정의 `pjt-c-admin` 쿼리 실행 권한 확인 (§10-6) |
+| PVC `Pending` 또는 Pod `FailedMount` | PV/PVC 매칭 또는 NFS 접근 문제 | §10-2 확인, Owner 로 `./gcloud/11-firewall.sh` 실행. `--nfs-server <VM_IP>` 로 명시 지정 |
+| Pod 생성 403 | 실행 주체 권한 | `container.developer` 확인 (8-3) |
+| `cloudbuild.connections.list denied` | 배포 주체에 `cloudbuild.connectionAdmin` 없음 | §6-2 로 점검 후 Owner 로 `00-bootstrap.sh` 재실행 |
+| 저장소 추가 시 `NOT_FOUND` / `PERMISSION_DENIED` | GitHub App 이 L2Comm03-01 에 접근 불가 | §7-2 에서 GitHub App Repository access 에 L2Comm03-01 추가 |
+| `BigQuery error ... This feature requires allowlisting` | `bq add-iam-policy-binding --dataset` 미지원 조직 | 자동으로 dataset ACL 방식으로 폴백됨. 8-4 로 `WRITER` 부여 확인 |
+| 빌드 로그에 `REPO_FULL_NAME: ...L2Comm02` | L2Comm02 트리거를 재사용함 | `trg-l2comm03-01-python-image` 를 사용. 최신 소스로 `git pull` 후 `30-platform.sh` 재실행 |
+| `triggers create github: unrecognized arguments: <트리거명>` | 트리거 이름을 위치 인자로 전달 | 최신 소스로 `git pull`. `--name=` 플래그를 사용하도록 수정됨 |
+| `kubectl logs` 가 `No agent available` | Private cluster 의 konnectivity 미연결 (마스터→노드 방화벽 누락) | Pod 실행 결과와 로그 통신은 별도 확인. 현재 클라이언트에는 자동 폴백이 없음. 근본 해결은 Owner 로 `./gcloud/11-firewall.sh` 실행 (§10-3) |
+| NFS 샘플 실행 로그가 비어 있음 | 이전 저장소(L2Comm02)의 `mnt/` 가 export 중 | `findmnt /srv/l2comm-nfs` 확인 후 `sudo bash /ssw/dlk/setup-nfs-server.sh` 재실행 |
+| RSVP 실행 후 테이블이 없음 | 인증 검사만 수행함 | `bq_auth_smoke.py`는 테이블 없이 SELECT 검사만 수행 |
+| `Invalid value for field 'filter'` (firewall-rules list) | `allowed.ports` 는 서버측 필터 미지원 | 네트워크로만 필터하고 포트는 `grep 2049` 로 거름 (10-3) |
+| `git pull` 이 local changes 로 중단 | `chmod +x` 로 인한 권한 비트 변경 | 내용 변경 여부를 `git diff`로 확인. 권한 비트 변경만 있으면 `git config core.fileMode false` 후 재시도 |
+| `/ssw/dlk already exists and is not the expected symlink` | 이전 체크아웃을 가리키는 링크가 남음 | `readlink -f /ssw/dlk`로 확인하고 §10-1 절차로 새 링크 연결. 실제 디렉터리는 백업 후 진행 |
+| `create-auto: unrecognized arguments: --workload-pool` | Autopilot 은 해당 플래그 미지원 | 최신 소스로 `git pull`. Autopilot 은 WI 가 기본 활성화이며 pool 은 자동 설정됨 |
+| `enable_master_authorized_networks should be enabled if private endpoint is enabled` | 플래그 조합 누락 | 최신 소스로 `git pull`. `--enable-master-authorized-networks` 가 함께 지정됨 |
+| 생성 중 Cloud NAT 안내 메시지 | Private nodes 안내(오류 아님) | AR 은 Private Google Access 로 접근하므로 무시 가능. 공인 인터넷 egress 가 필요하면 Cloud NAT 구성 |
+| `ALREADY_EXISTS` 로 중단 | 멱등 처리 밖의 자원 | 메시지의 자원명을 확인하고 기존 것을 그대로 사용 |
+
+### 디버깅 명령
+
+```bash
+export KUBECONFIG=$HOME/.kube/config_new-autopilot
+
+# 이벤트
+kubectl -n l2comm-batch get events --sort-by=.lastTimestamp | tail -20
+
+# PVC / PV 상태
+kubectl -n l2comm-batch get pvc,pv
+
+# VM 에서 NFS 자체 점검
+showmount -e $(hostname -I | awk '{print $1}')
+
+# 현재 계정 / 프로젝트
+gcloud config list
+```
+
+---
+
+## 14. 정리
+
+```bash
+export KUBECONFIG=$HOME/.kube/config_new-autopilot
+kubectl -n l2comm-batch get pods -l app=l2comm-batch
+# 종료 상태와 이름을 확인한 뒤 개별 삭제합니다.
+# kubectl -n l2comm-batch delete pod POD_NAME
+```
+
+전체 자원 삭제 (각 단계 확인 프롬프트):
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01
+./gcloud/90-teardown.sh
+```
+
+> 서비스 계정과 IAM 바인딩은 자동 삭제되지 않습니다.
+> 스크립트가 마지막에 출력하는 수동 정리 명령을 참고하십시오.

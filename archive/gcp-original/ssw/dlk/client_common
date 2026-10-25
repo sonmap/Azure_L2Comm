@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Shared settings for RSVP batch on infra-son01.
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config_new-autopilot}"
+export NAMESPACE="${NAMESPACE:-l2comm-batch}"
+export POD_MOUNT_PATH="${POD_MOUNT_PATH:-/home/jupyter}"
+# Existing setup-nfs-server.sh exports <repository>/mnt as NFSv4 fsid=0.
+export NFS_PATH="${NFS_PATH:-/batch_gke/l2/rsvp}"
+export PV_NAME="${PV_NAME:-l2comm-rsvp-pv}"
+export PVC_NAME="${PVC_NAME:-l2comm-rsvp-pvc}"
+export SA_KEY_PATH="${SA_KEY_PATH:-/home/jupyter/.oefj}"
+export BQ_JOB_PROJECT="${BQ_JOB_PROJECT:-pjt-c-admin}"

@@ -1,0 +1,30 @@
+# Substitute IMAGE_PLACEHOLDER with the actual ACR image before applying.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: l2comm-debug
+  namespace: l2comm-batch
+spec:
+  serviceAccountName: ksa-l2comm-batch
+  restartPolicy: Never
+  activeDeadlineSeconds: 1800
+  containers:
+    - name: debug
+      image: IMAGE_PLACEHOLDER
+      command: ["/bin/bash", "-c", "sleep 1800"]
+      env:
+        - name: SA_KEY_PATH
+          value: /home/jupyter/.oefj
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /home/jupyter/.oefj
+      resources:
+        requests: {cpu: "100m", memory: "256Mi"}
+        limits: {cpu: "1", memory: "1Gi"}
+      volumeMounts:
+        - name: nfs
+          mountPath: /home/jupyter
+          readOnly: true
+  volumes:
+    - name: nfs
+      persistentVolumeClaim:
+        claimName: l2comm-rsvp-pvc

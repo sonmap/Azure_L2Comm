@@ -1,0 +1,198 @@
+# gcloud 프로비저닝
+
+`Gcp_Managed_GKE_L2Comm02`의 `terraform/00-bootstrap`, `terraform/10-network`,
+`terraform/30-infra-manager`를 gcloud CLI로 1:1 전환한 스크립트입니다.
+`20-source-connection`은 L2Comm02에서도 gcloud 기반이었고, 멱등성만 보완했습니다.
+
+**L2Comm02와 달리 Workflows / Cloud Scheduler를 사용하지 않습니다.**
+배치 실행은 `ssw/dlk/run-gke.sh` -> `client_gke`가 GKE API로 Pod를 직접 생성하는
+경로로 바뀌었고, 그에 따라 `40-scheduler.sh`와 `workflow.yaml.tmpl`은 삭제되었습니다.
+
+---
+
+## 1. 파일 구성
+
+| 파일 | L2Comm02 대응 | 내용 |
+|---|---|---|
+| `00-env.sh` | `*/variables.tf`, `*/terraform.tfvars.example` | 공통 변수 + 멱등 헬퍼. 모든 스크립트가 `source` |
+| `00-bootstrap.sh` | `terraform/00-bootstrap` | API 활성화 / 프로젝트 IAM **(Owner 실행)** |
+| `10-network.sh` | `terraform/10-network` | Shared VPC 연결 / Subnet / Subnet IAM **(Owner 실행)** |
+| `11-firewall.sh` | — (신규) | Host 방화벽: GKE→VM NFS(2049), Control Plane→Node(konnectivity) **(Owner 실행, 클러스터 생성 후)** |
+| `05-check-permissions.sh` | — (신규) | 배포 주체 권한 사전 점검. `test-iam-permissions` 로 누락 Role 을 미리 식별 |
+| `20-source-connection.sh` | `20-source-connection/README.md` | Cloud Build GitHub Repository 연결 |
+| `30-platform.sh` | `terraform/30-infra-manager` | AR / SA / Trigger / GKE Autopilot / Namespace / KSA |
+| `90-teardown.sh` | `terraform destroy` | 생성 역순 삭제 (대화형 확인) |
+| `99-verify.sh` | `terraform output` / `plan` | 생성 자원 상태 일괄 점검 |
+
+---
+
+## 2. 실행
+
+```bash
+chmod +x gcloud/*.sh
+vi gcloud/00-env.sh          # 프로젝트 ID / CIDR / SA 값 확인
+
+# --- Owner (admin@sonmap.net) ---
+gcloud config set account admin@sonmap.net
+./gcloud/00-bootstrap.sh
+./gcloud/10-network.sh       # CIDR 중복 확인 프롬프트 있음
+
+# --- 배포 주체 (cho@sonmap.net) ---
+gcloud config set account cho@sonmap.net
+./gcloud/05-check-permissions.sh   # 권한 사전 점검
+./gcloud/20-source-connection.sh
+./gcloud/30-platform.sh      # GKE 생성 15~25분
+
+# --- Owner 로 복귀: 방화벽은 클러스터 생성 후 ---
+gcloud config set account admin@sonmap.net
+./gcloud/11-firewall.sh
+
+gcloud config set account cho@sonmap.net
+./gcloud/99-verify.sh
+```
+
+### 선택 플래그
+
+| 환경변수 | 기본값 | 설명 |
+|---|---|---|
+| `CREATE_INFRAMGR` | `false` | Infrastructure Manager를 병행 운영할 때만 `true`. `sa-l2comm-inframgr` 및 `config.*` 권한 생성 |
+| `CREATE_TFSTATE_BUCKET` | `false` | Terraform과 병행할 때만 `true`. gcloud 전용 운영에서는 불필요 |
+| `GRANT_VM_DEPLOYER` | `false` | 관리 VM의 기본 SA로 스크립트를 실행할 때 `true`. 배포용 Role을 VM SA에도 부여 |
+
+---
+
+## 2-1. 서비스 계정 구성 (L2Comm02 대비 단순화)
+
+```text
+L2Comm02                          L2Comm03-01
+─────────────────────────         ─────────────────────────
+sa-l2comm-tf-admin        ──┐
+                            └──>  cho@sonmap.net (직접 실행)
+
+sa-l2comm-cloudbuild      ──┐
+sa-l2comm-workflow        ──┼──>  sa-l2comm-gke
+sa-l2comm-runtime         ──┘
+```
+
+| 주체 | 생성 위치 | 용도 |
+|---|---|---|
+| `admin@sonmap.net` | — (Owner 계정) | **IAM 부여 + 네트워크 관리.** `00-bootstrap.sh` 와 `10-network.sh` 를 이 계정으로 실행 |
+| `cho@sonmap.net` | — (기존 계정) | 배포 주체. `00-bootstrap.sh` 가 Role 부여, `10-network.sh` 가 Subnet networkUser 부여 |
+| `sa-l2comm-gke` | `30-platform.sh` | Cloud Build / GKE Runtime (Pod Workload Identity) |
+
+`sa-l2comm-gke` 는 Build + Runtime Role 을 갖습니다: `artifactregistry.writer`,
+`logging.logWriter`, `storage.objectViewer`, `bigquery.jobUser`, `compute.viewer`,
+Dataset `bigquery.dataEditor`.
+
+Workflows 를 쓰지 않으므로 `workflows.invoker` 는 제거했고, Pod 생성 권한
+(`container.developer`)은 SA 가 아니라 **run-gke.sh 를 실행하는 주체**
+(`cho@sonmap.net` 및 VM 기본 SA)에 부여합니다.
+
+배포 주체에는 이 SA 에 대한 `roles/iam.serviceAccountUser`(actAs)가 필요하며
+`30-platform.sh` 가 자동 부여합니다.
+
+> Build 주체와 Runtime 주체가 동일 SA 가 되므로 최소권한 분리는 약해집니다.
+> 운영 전환 시 분리가 필요하면 `00-env.sh` 의 `SA_GKE` 를 용도별로 되돌립니다.
+
+---
+
+## 3. Terraform → gcloud 매핑표
+
+### 00-bootstrap
+
+| Terraform | gcloud |
+|---|---|
+| `google_project_service` (edge 17 / host 3) | `gcloud services enable <API...> --project=` — 멱등 |
+| `google_storage_bucket.tfstate` | `gcloud storage buckets create` + **`buckets update --versioning` (별도 명령)** |
+| `google_service_account` | `gcloud iam service-accounts create` |
+| `google_project_iam_member` (for_each) | `gcloud projects add-iam-policy-binding` 반복 |
+| `google_storage_bucket_iam_member` | `gcloud storage buckets add-iam-policy-binding` |
+| `google_service_account_iam_member` | `gcloud iam service-accounts add-iam-policy-binding` |
+
+### 10-network
+
+| Terraform | gcloud |
+|---|---|
+| `data.google_project` (프로젝트 번호) | `gcloud projects describe --format='value(projectNumber)'` |
+| `google_compute_shared_vpc_service_project` | `gcloud compute shared-vpc associated-projects add` |
+| `google_compute_subnetwork` + `secondary_ip_range` | `gcloud compute networks subnets create --range --secondary-range NAME=CIDR --enable-private-ip-google-access` |
+| `google_compute_subnetwork_iam_member` | `gcloud compute networks subnets add-iam-policy-binding` |
+| `google_project_iam_member` (host) | `gcloud projects add-iam-policy-binding` |
+| `output` | `gcloud compute networks subnets describe --format=` |
+
+### 30-infra-manager → 30-platform
+
+| Terraform | gcloud |
+|---|---|
+| `google_artifact_registry_repository` | `gcloud artifacts repositories create --repository-format=docker` |
+| `google_service_account` x3 | `gcloud iam service-accounts create` |
+| `google_bigquery_dataset_iam_member` | ⚠️ gcloud에 dataset 레벨 IAM 명령이 없음 → `bq add-iam-policy-binding --dataset=true` |
+| `google_artifact_registry_repository_iam_member` | `gcloud artifacts repositories add-iam-policy-binding` |
+| `google_cloudbuild_trigger` (2nd-gen) | `gcloud builds triggers create github --repository=projects/../connections/../repositories/.. --branch-pattern` |
+| `google_container_cluster` (Autopilot) | `gcloud container clusters create-auto` (§4 참고) |
+| `google_service_account_iam_member` (WI) | `add-iam-policy-binding --member="serviceAccount:PROJECT.svc.id.goog[ns/ksa]"` |
+| `google_workflows_workflow` + `templatefile()` | **제거.** Workflows 미사용 — `ssw/dlk/client_gke` 가 `kubectl apply` 로 Pod 생성 |
+
+---
+
+## 4. GKE Autopilot 플래그 매핑
+
+HCL 블록과 gcloud 플래그가 직관적으로 대응되지 않는 부분입니다.
+
+| HCL | gcloud |
+|---|---|
+| `enable_autopilot = true` | 서브커맨드 자체가 `create-auto` |
+| `ip_allocation_policy.cluster_secondary_range_name` | `--cluster-secondary-range-name` |
+| Service secondary range 미지정 | `--services-secondary-range-name`을 **주지 않음** (GKE managed `34.118.224.0/20`) |
+| `private_cluster_config` 3개 필드 | `--enable-private-nodes --enable-private-endpoint --master-ipv4-cidr` (+ `--enable-master-authorized-networks` 필수) |
+| `master_authorized_networks_config { private_endpoint_enforcement_enabled = false }` | `--enable-master-authorized-networks --no-enable-authorized-networks-on-private-endpoint`. 앞 플래그가 없으면 private endpoint 와 함께 쓸 때 400 에러 |
+| `workload_identity_config.workload_pool` | **플래그 없음.** `create-auto` 는 `--workload-pool` 을 받지 않습니다(Standard 전용). Autopilot 은 WI 가 항상 켜져 있고 pool 은 `<PROJECT_ID>.svc.id.goog` 로 고정 |
+| `deletion_protection = false` | gcloud에 해당 개념 없음 (삭제 시 `--quiet`) |
+| Shared VPC network/subnetwork | 반드시 **full resource path** 로 지정 (`projects/HOST/global/networks/...`) |
+
+---
+
+## 5. 전환 시 주의사항
+
+### 5-1. 멱등성
+Terraform은 state로 "이미 있음"을 판별하지만 gcloud는 `ALREADY_EXISTS` 에러로 종료합니다.
+스크립트는 `set -Eeuo pipefail` 상태이므로 `ok_if_exists()` / `describe || create` 패턴으로
+재실행 안전성을 확보했습니다. 이 처리가 없으면 중간에 멈춥니다.
+
+### 5-2. IAM 바인딩 동작
+- `add-iam-policy-binding`은 Terraform의 `*_iam_member`와 동일하게 **additive** 입니다.
+- `--condition=None`을 명시하지 않으면 조건부 바인딩이 있을 때 대화형 프롬프트가 떠서
+  자동화가 멈춥니다. 전 구간에 포함했습니다.
+- 삭제는 자동이 아니므로 teardown 시 `remove-iam-policy-binding`을 직접 실행해야 합니다.
+
+### 5-3. 실행 순서 (terraform `depends_on` 대체)
+
+```
+services enable → SA 생성 → IAM 부여 → Shared VPC 연결
+  → Subnet 생성 → Subnet IAM → Cluster 생성 → WI 바인딩 → Namespace/KSA
+```
+
+특히 **Subnet IAM(`compute.networkUser`)이 Cluster 생성보다 먼저**여야 하고,
+`container.hostServiceAgentUser`가 없으면 Autopilot 생성이 실패합니다.
+
+### 5-4. RSVP Pod 실행
+
+VM RSVP 래퍼 → `ssw/dlk/run-gke.sh` → `client_gke` → PV/PVC·Pod 적용 →
+Succeeded 대기 → 로그 → 성공 Pod 삭제입니다.
+NFS `/batch_gke/l2/rsvp`는 `/home/jupyter`로 마운트되며 `.oefj` 키 인증 샘플을 실행합니다.
+실제 명령은 `docs/RUNBOOK.md` §10~11을 따릅니다.
+Job의 backoffLimit·TTL·KEEP_JOB 및 Cloud Logging 자동 폴백은 지원하지 않습니다.
+
+## 6. L2Comm02 대비 제거된 자원
+
+gcloud 전환으로 아래가 불필요해졌습니다.
+
+- `sa-l2comm-tf-admin` 서비스 계정 (배포 주체가 `cho@sonmap.net` 직접 실행으로 변경)
+- 플랫폼은 `sa-l2comm-gke`를 사용합니다. RSVP 샘플의 `.oefj` 키 인증은 별도입니다. 기존 SA는 검증 없이 삭제하지 않습니다.
+- `sa-l2comm-inframgr` 서비스 계정
+- `roles/config.agent`, `roles/config.admin`
+- `config.googleapis.com` API
+- `gcloud infra-manager deployments apply` 단계
+- GCS tfstate 버킷 및 `roles/storage.objectAdmin` 바인딩
+
+병행 운영이 필요하면 `CREATE_INFRAMGR=true`, `CREATE_TFSTATE_BUCKET=true` 로 실행합니다.
